@@ -13,6 +13,9 @@ import type {
   AccountBalanceResponse,
   AccountsApiResponse,
   ApiError,
+  BuyingPower,
+  BuyingPowerApiResponse,
+  Currency,
   CurrentPriceResponse,
   ErrorResponse,
   OAuth2ErrorResponse,
@@ -96,6 +99,33 @@ export class TossApiService {
       return data;
     } catch (error) {
       throw this.handleApiError(error, '보유 주식 조회에 실패했습니다.');
+    }
+  }
+
+  /**
+   * 매수 가능 금액 조회 (GET /api/v1/buying-power)
+   * - 미수 거래를 제외한 현금 기반 매수 가능 금액 (cashBuyingPower)
+   * - 앱 화면의 '예수금/주문가능현금'에 가장 가까운 공식 API
+   */
+  async getBuyingPower(currency: Currency = 'KRW'): Promise<BuyingPower> {
+    try {
+      const accessToken = await this.getAccessToken();
+      const accountSeq = await this.resolveAccountSeq();
+
+      const { data } = await firstValueFrom(
+        this.httpService.get<BuyingPowerApiResponse>(
+          `${this.baseUrl}/api/v1/buying-power`,
+          {
+            headers: this.buildAuthHeaders(accessToken, accountSeq),
+            params: { currency },
+            timeout: 10_000,
+          },
+        ),
+      );
+
+      return data.result;
+    } catch (error) {
+      throw this.handleApiError(error, '매수 가능 금액 조회에 실패했습니다.');
     }
   }
 

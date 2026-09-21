@@ -2,6 +2,8 @@ import { Controller, Get, Query } from '@nestjs/common';
 import { TossApiService } from './toss-api.service.js';
 import type {
   AccountBalanceResponse,
+  BuyingPower,
+  Currency,
   TossAccount,
 } from './interfaces/toss-api.interface.js';
 
@@ -28,5 +30,16 @@ export class TossApiController {
     @Query('symbol') symbol?: string,
   ): Promise<AccountBalanceResponse> {
     return this.tossApiService.getMyAccountBalance(symbol);
+  }
+
+  /**
+   * GET /api/v1/buying-power?currency=KRW
+   * 현금 매수 가능 금액(예수금에 가장 가까운 값) 조회
+   */
+  @Get('buying-power')
+  getBuyingPower(
+    @Query('currency') currency: Currency = 'KRW',
+  ): Promise<BuyingPower> {
+    return this.tossApiService.getBuyingPower(currency);
   }
 }

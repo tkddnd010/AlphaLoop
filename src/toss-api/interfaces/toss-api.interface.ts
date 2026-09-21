@@ -17,6 +17,21 @@ export interface AccountsApiResponse {
   result: TossAccount[];
 }
 
+/** 통화 코드 (매수가능금액 등) */
+export type Currency = 'KRW' | 'USD';
+
+/** GET /api/v1/buying-power 의 result */
+export interface BuyingPower {
+  currency: Currency;
+  /** 현금 기반 매수 가능 금액 (미수 미발생 기준). KRW는 정수 문자열, USD는 소수 가능 */
+  cashBuyingPower: string;
+}
+
+/** GET /api/v1/buying-power 성공 응답 */
+export interface BuyingPowerApiResponse {
+  result: BuyingPower;
+}
+
 /** 보유 종목 한 건 */
 export interface HoldingStock {
   ticker: string;
