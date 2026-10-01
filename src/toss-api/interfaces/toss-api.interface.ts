@@ -54,18 +54,25 @@ export interface AccountBalanceResponse {
   holdings: HoldingStock[];
 }
 
-/** 종목 현재가 조회 응답 */
-export interface CurrentPriceResponse {
-  ticker: string;
-  name: string;
+/** GET /api/v1/prices - 토스 API 공식 현재가 응답 */
+export interface PriceResponse {
+  symbol: string;
+  timestamp: string;
+  lastPrice: string;
+  currency: Currency;
+}
+
+/** GET /api/v1/prices 성공 응답 (배열) */
+export interface PricesApiResponse {
+  result: PriceResponse[];
+}
+
+/** 현재가 조회 및 가격 필터링 결과 */
+export interface PriceCheckResult {
+  symbol: string;
   currentPrice: number;
-  change: number;
-  changeRate: number;
-  volume: number;
-  high: number;
-  low: number;
-  open: number;
-  previousClose: number;
+  currency: string;
+  isUnder30000: boolean;
   timestamp: string;
 }
 
@@ -109,4 +116,60 @@ export interface ApiError {
  */
 export interface ErrorResponse {
   error: ApiError;
+}
+
+/** 주문 방향 (매수/매도) */
+export type OrderSide = 'BUY' | 'SELL';
+
+/** 호가 유형 */
+export type OrderType = 'LIMIT' | 'MARKET';
+
+/** 주문 유효 조건 */
+export type TimeInForce = 'DAY' | 'CLS';
+
+/** 주문 생성 요청 */
+export interface CreateOrderRequest {
+  symbol: string;
+  orderSide: OrderSide;
+  orderType: OrderType;
+  quantity?: string;
+  orderAmount?: string;
+  orderPrice?: string;
+  timeInForce?: TimeInForce;
+  clientOrderId?: string;
+  confirmHighValueOrder?: boolean;
+}
+
+/** 주문 상태 */
+export type OrderStatus =
+  | 'PENDING'
+  | 'PARTIAL_FILLED'
+  | 'FILLED'
+  | 'PENDING_CANCEL'
+  | 'CANCELED'
+  | 'PENDING_REPLACE'
+  | 'REPLACED'
+  | 'REJECTED'
+  | 'CANCEL_REJECTED'
+  | 'REPLACE_REJECTED';
+
+/** 주문 정보 */
+export interface Order {
+  orderId: string;
+  clientOrderId?: string;
+  symbol: string;
+  orderSide: OrderSide;
+  orderType: OrderType;
+  quantity: string;
+  orderPrice?: string;
+  filledQuantity: string;
+  averageFillPrice?: string;
+  status: OrderStatus;
+  orderedAt: string;
+  currency: Currency;
+}
+
+/** POST /api/v1/orders 성공 응답 */
+export interface CreateOrderResponse {
+  result: Order;
 }

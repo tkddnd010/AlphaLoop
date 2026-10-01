@@ -1,0 +1,47 @@
+// schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// 1. 전략 로그 (StrategyLog) - LLM이 왜 이런 판단을 했는지 기록
+model StrategyLog {
+  id          Int      @id @default(autoincrement())
+  symbol      String   // 분석 종목 코드 (예: "042700")
+  dartId      String?  // 분석한 DART 공시 번호 (어떤 공시를 봤는지 연결)
+  llmScore    Int      // LLM이 평가한 호재/점수 (예: 1~10)
+  reason      String   // LLM의 매수 추천 근거 (이 내용이 Slack 브리핑으로 전송됨)
+  decision    String   // 판단 결과 (BUY, HOLD, SELL)
+  isApproved  Boolean  @default(false) // 사용자의 Slack 결재(승인) 여부
+  analyzedAt  DateTime @default(now()) // 분석 완료 시간
+
+  trades      TradeHistory[] // 이 분석을 바탕으로 실행된 실제 거래들
+}
+
+// 2. 거래 내역 (TradeHistory) - 실제 토스 API로 쏜 주문 기록
+model TradeHistory {
+  id          Int      @id @default(autoincrement())
+  symbol      String   // 종목 코드
+  orderType   String   // BUY, SELL
+  price       Int      // 체결/주문 가격
+  quantity    Int      // 주문 수량
+  status      String   // 주문 상태 (COMPLETED, PENDING, REJECTED)
+  orderedAt   DateTime @default(now()) // 주문 발생 시간
+  
+  // 어떤 전략 로그(LLM 판단)를 보고 매수했는지 관계 설정
+  strategyId  Int?     
+  strategy    StrategyLog? @relation(fields: [strategyId], references: [id])
+}
+
+// 3. 에러 및 시스템 로그 (ErrorLog) - 타임아웃, 예수금 부족 등 시스템 이벤트 기록
+model ErrorLog {
+  id          Int      @id @default(autoincrement())
+  module      String   // 발생 위치 (예: "TossAPI", "LLM", "DART")
+  errorCode   String?  // HTTP 에러 코드 (예: "422", "429")
+  message     String   // 상세 에러 내용 (예: "예수금 부족으로 매수 주문 차단됨")
+  createdAt   DateTime @default(now())
+}
