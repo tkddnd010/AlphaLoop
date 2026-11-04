@@ -138,6 +138,8 @@ export interface CreateOrderRequest {
   timeInForce?: TimeInForce;
   clientOrderId?: string;
   confirmHighValueOrder?: boolean;
+  /** 우리 DB StrategyLog 연결용. 토스 API로는 보내지 않음 */
+  strategyId?: number;
 }
 
 /** 주문 상태 */
@@ -153,7 +155,7 @@ export type OrderStatus =
   | 'CANCEL_REJECTED'
   | 'REPLACE_REJECTED';
 
-/** 주문 정보 */
+/** 주문 정보 (내부 정규화) */
 export interface Order {
   orderId: string;
   clientOrderId?: string;
@@ -169,7 +171,61 @@ export interface Order {
   currency: Currency;
 }
 
-/** POST /api/v1/orders 성공 응답 */
+/** POST /api/v1/orders 직후 응답. 체결 상세는 아직 없을 수 있다 */
+export interface CreateOrderResult {
+  orderId: string;
+  clientOrderId?: string | null;
+}
+
 export interface CreateOrderResponse {
-  result: Order;
+  result: CreateOrderResult;
+}
+
+/** GET /api/v1/orders/{orderId} 의 체결 정보 */
+export interface TossOrderExecution {
+  filledQuantity: string;
+  averageFilledPrice: string;
+  filledAmount: string;
+  commission: string;
+  tax: string;
+  filledAt: string;
+  settlementDate: string;
+}
+
+/** GET /api/v1/orders/{orderId} 의 result */
+export interface TossOrderDetail {
+  orderId: string;
+  clientOrderId?: string | null;
+  symbol: string;
+  side: OrderSide;
+  orderType: OrderType;
+  timeInForce?: TimeInForce | string;
+  status: OrderStatus;
+  price?: string;
+  quantity: string;
+  orderAmount?: string | null;
+  currency: Currency;
+  orderedAt: string;
+  canceledAt?: string | null;
+  execution?: TossOrderExecution | null;
+}
+
+export interface GetOrderResponse {
+  result: TossOrderDetail;
+}
+
+/** 예수금 균등 배분 결과 */
+export interface BuyAllocation {
+  symbol: string;
+  strategyId: number;
+  price: number;
+  budget: number;
+  quantity: number;
+}
+
+export interface ApprovedBuyExecution {
+  cashBuyingPower: number;
+  allocations: BuyAllocation[];
+  skipped: Array<{ symbol: string; strategyId: number; reason: string }>;
+  orders: Order[];
 }

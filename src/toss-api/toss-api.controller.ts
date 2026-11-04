@@ -1,11 +1,13 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { TossApiService } from './toss-api.service.js';
 import type {
   AccountBalanceResponse,
+  ApprovedBuyExecution,
   BuyingPower,
   Order,
   PriceCheckResult,
   TossAccount,
+  TossOrderDetail,
 } from './interfaces/toss-api.interface.js';
 
 @Controller('toss')
@@ -39,7 +41,7 @@ export class TossApiController {
    * 예: GET /toss/price/005930
    */
   @Get('price/:symbol')
-  checkPrice(@Query('symbol') symbol: string): Promise<PriceCheckResult> {
+  checkPrice(@Param('symbol') symbol: string): Promise<PriceCheckResult> {
     return this.tossApiService.getCurrentPrice(symbol);
   }
 
@@ -79,6 +81,15 @@ export class TossApiController {
   }
 
   /**
+   * POST /toss/order/execute-approved
+   * 오늘 슬랙 승인된 종목에 예수금을 균등 배분해 시장가 매수
+   */
+  @Post('order/execute-approved')
+  executeApprovedBuys(): Promise<ApprovedBuyExecution> {
+    return this.tossApiService.executeApprovedBuys();
+  }
+
+  /**
    * POST /toss/order/sell
    * 매도 테스트용 엔드포인트
    * Body: { symbol: string, orderType?: 'MARKET' | 'LIMIT', price?: string }
@@ -90,9 +101,10 @@ export class TossApiController {
       symbol: string;
       orderType?: 'MARKET' | 'LIMIT';
       price?: string;
+      quantity?: number;
     },
   ): Promise<Order> {
-    const { symbol, orderType = 'MARKET', price } = body;
+    const { symbol, orderType = 'MARKET', price, quantity = 1 } = body;
 
     if (orderType === 'LIMIT') {
       if (!price) {
@@ -101,6 +113,15 @@ export class TossApiController {
       return this.tossApiService.sellLimit1Share(symbol, price);
     }
 
-    return this.tossApiService.sellMarket1Share(symbol);
+    return this.tossApiService.sellMarketShares(symbol, quantity);
+  }
+
+  /**
+   * GET /toss/order/:orderId
+   * 토스 주문 체결 상세 조회
+   */
+  @Get('order/:orderId')
+  getOrder(@Param('orderId') orderId: string): Promise<TossOrderDetail> {
+    return this.tossApiService.getOrder(orderId);
   }
 }

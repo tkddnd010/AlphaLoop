@@ -58,6 +58,13 @@ export class SlackController {
       recommendation,
     );
 
+    if (!messageTs) {
+      return {
+        success: false,
+        message: `${body.symbol}은(는) 예수금으로 1주를 살 수 없어 슬랙 알림을 보내지 않았습니다.`,
+      };
+    }
+
     return {
       success: true,
       message: 'Slack 메시지 전송 완료',
@@ -127,6 +134,15 @@ export class SlackController {
           recommendation,
         );
 
+        if (!messageTs) {
+          results.push({
+            success: false,
+            symbol: rec.symbol,
+            error: '예수금으로 1주를 살 수 없어 슬랙 알림을 보내지 않음',
+          });
+          continue;
+        }
+
         results.push({
           success: true,
           symbol: rec.symbol,
@@ -171,6 +187,21 @@ export class SlackController {
       success: true,
       count: pendingLogs.length,
       data: pendingLogs,
+    };
+  }
+
+  /**
+   * 당일 매수/매도 슬랙 리포트 (거래가 있을 때만 전송)
+   * POST /slack/daily-report
+   */
+  @Post('daily-report')
+  @HttpCode(HttpStatus.OK)
+  async sendDailyReport() {
+    const sent = await this.slackService.sendDailyTradeReport();
+    return {
+      success: true,
+      sent,
+      message: sent ? '당일 매매 리포트를 슬랙으로 보냈습니다.' : '당일 매매 내역이 없어 리포트를 보내지 않았습니다.',
     };
   }
 }

@@ -35,6 +35,17 @@ export interface SlackActionPayload {
   response_url: string;
 }
 
+export type SellTrigger = 'STOP_LOSS' | 'DANGEROUS_FILING' | 'TAKE_PROFIT';
+
+export interface SellNotice {
+  symbol: string;
+  companyName?: string;
+  quantity: number;
+  price: number;
+  reason: string;
+  trigger: SellTrigger;
+}
+
 /**
  * Slack 결재 결과
  */

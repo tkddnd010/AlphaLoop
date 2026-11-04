@@ -6,13 +6,17 @@ import { TossApiService } from '../toss-api/toss-api.service.js';
 import type {
   ApprovalResult,
   BuyRecommendation,
+  SellNotice,
 } from './interfaces/slack.interface.js';
+import type { StockAnalysisResult } from '../llm/interfaces/llm.interface.js';
 
 @Injectable()
 export class SlackService implements OnModuleInit {
   private readonly logger = new Logger(SlackService.name);
   private app: App;
   private readonly defaultChannel: string;
+  private openHoursBuyTimer: ReturnType<typeof setTimeout> | null = null;
+  private executingApprovedBuys = false;
 
   constructor(
     private readonly configService: ConfigService,
@@ -91,31 +95,48 @@ export class SlackService implements OnModuleInit {
             return;
           }
 
-          // 2. StrategyLog isApproved = true로 업데이트
+          const market = await this.tossApiService.getKRMarketStatus();
+          const buyNow = Boolean(market.isRegularMarketOpen);
+          const regularStart = market.regularMarket?.start;
+          const beforeOpen =
+            !buyNow &&
+            Boolean(regularStart) &&
+            Date.now() < new Date(regularStart).getTime();
+
+          if (!buyNow && !beforeOpen) {
+            await this.updateSlackMessage(
+              client,
+              channelId!,
+              messageTs!,
+              `🚫 *장 마감 뒤에는 매수 결재를 할 수 없습니다.*\n\n다음 날 자정 이후 새로 오는 추천을 기다려 주세요.`,
+              'cancelled',
+            );
+            return;
+          }
+
           await this.prisma.strategyLog.update({
             where: { id: strategyLogId },
             data: { isApproved: true },
           });
 
-          // 3. 실제 매수 주문 실행 (TossApiService 호출)
-          const orderResult = await this.tossApiService.buyMarket1Share(
-            strategyLog.symbol,
-          );
-
           this.logger.log(
-            `✅ 매수 주문 완료: ${strategyLog.symbol}, orderId=${orderResult.orderId}`,
+            `✅ 매수 결재 완료: strategyLogId=${strategyLogId}, symbol=${strategyLog.symbol}, buyNow=${buyNow}`,
           );
 
-          // 4. Slack 메시지 업데이트
+          if (buyNow) {
+            this.scheduleOpenHoursBuy();
+          }
+
           await this.updateSlackMessage(
             client,
             channelId!,
             messageTs!,
-            `✅ *매수 주문이 집행되었습니다!*\n\n` +
+            `✅ *매수 결재가 완료되었습니다.*\n\n` +
               `• 종목: ${strategyLog.symbol}\n` +
-              `• 주문 ID: ${orderResult.orderId}\n` +
-              `• 상태: ${orderResult.status}\n` +
-              `• 승인자: <@${userId}>`,
+              `• 승인자: <@${userId}>\n\n` +
+              (buyNow
+                ? `정규장이 열려 있어 다른 승인과 묶어 예수금을 나눈 뒤 바로 시장가 매수합니다.`
+                : `오늘 09:00에 매수가능금액을 당일 승인 종목 수만큼 나눠 시장가 매수합니다.`),
             'success',
           );
         } catch (error) {
@@ -194,16 +215,74 @@ export class SlackService implements OnModuleInit {
   }
 
   /**
+   * 정규장 중 승인은 버튼을 연속으로 눌러도 한 번에 배분하도록 잠시 모은다.
+   */
+  private scheduleOpenHoursBuy(): void {
+    if (this.openHoursBuyTimer) {
+      clearTimeout(this.openHoursBuyTimer);
+    }
+    this.openHoursBuyTimer = setTimeout(() => {
+      this.openHoursBuyTimer = null;
+      void this.flushOpenHoursBuys();
+    }, 8_000);
+  }
+
+  private async flushOpenHoursBuys(): Promise<void> {
+    if (this.executingApprovedBuys) {
+      return;
+    }
+    this.executingApprovedBuys = true;
+    try {
+      const market = await this.tossApiService.getKRMarketStatus();
+      if (!market.isRegularMarketOpen) {
+        this.logger.log('정규장이 아니라 즉시 매수를 건너뜁니다.');
+        return;
+      }
+      const result = await this.tossApiService.executeApprovedBuys();
+      this.logger.log(
+        `정규장 즉시 매수 완료: 체결 ${result.orders.length}건, 건너뜀 ${result.skipped.length}건`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `정규장 즉시 매수 실패: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      await this.prisma.errorLog.create({
+        data: {
+          module: 'SlackService',
+          errorCode: 'OPEN_HOURS_BUY_FAILED',
+          message: `정규장 즉시 매수 실패: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      });
+    } finally {
+      this.executingApprovedBuys = false;
+    }
+  }
+
+  /**
    * 매수 추천 브리핑을 Slack으로 전송
    * @param recommendation 매수 추천 정보
    * @param channelId Slack 채널 ID (기본값: 환경변수 SLACK_CHANNEL_ID)
-   * @returns 전송된 메시지의 타임스탬프
+   * @returns 전송된 메시지의 타임스탬프. 예수금으로 1주도 못 사면 보내지 않고 null
    */
   async sendBuyApprovalMessage(
     recommendation: BuyRecommendation,
     channelId?: string,
-  ): Promise<string> {
+  ): Promise<string | null> {
     const channel = channelId || this.defaultChannel;
+
+    const buyingPower = await this.tossApiService.getBuyingPower('KRW');
+    const cash = parseFloat(buyingPower.cashBuyingPower);
+    if (
+      !Number.isFinite(recommendation.currentPrice) ||
+      recommendation.currentPrice <= 0 ||
+      !Number.isFinite(cash) ||
+      cash < recommendation.currentPrice
+    ) {
+      this.logger.warn(
+        `슬랙 매수 알림 생략: ${recommendation.symbol} 현재가 ${recommendation.currentPrice.toLocaleString()}원, 예수금 ${Number.isFinite(cash) ? cash.toLocaleString() : '-'}원`,
+      );
+      return null;
+    }
 
     try {
       const result = await this.app.client.chat.postMessage({
@@ -288,7 +367,6 @@ export class SlackService implements OnModuleInit {
     } catch (error) {
       this.logger.error(`Slack 메시지 전송 실패: ${error}`);
 
-      // 에러 로깅
       await this.prisma.errorLog.create({
         data: {
           module: 'SlackService',
@@ -299,6 +377,154 @@ export class SlackService implements OnModuleInit {
 
       throw error;
     }
+  }
+
+  /**
+   * 자정 이후 관심종목 점수 브리핑
+   */
+  async sendWatchlistBriefing(results: StockAnalysisResult[]): Promise<void> {
+    if (results.length === 0) return;
+
+    const lines = results.map((item) => {
+      const name = item.companyName || item.stockCode;
+      const price =
+        item.currentPrice > 0 ? `${item.currentPrice.toLocaleString()}원` : '-';
+      return `• *${name}* (${item.stockCode}) ${item.score}점 ${item.recommendation} / ${price}`;
+    });
+
+    await this.app.client.chat.postMessage({
+      channel: this.defaultChannel,
+      text: '오늘의 관심종목 분석',
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: '오늘의 관심종목 분석',
+            emoji: true,
+          },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text:
+              `${lines.join('\n')}\n\n` +
+              `7점 이상이면서 예수금으로 1주를 살 수 있는 종목만 아래에서 매수 결재를 받습니다. 09:00 전 승인은 장 시작 때, 09:00 이후 승인은 바로 매수합니다. 장 마감 뒤에는 결재할 수 없고 다음 날 추천을 기다리면 됩니다.`,
+          },
+        },
+      ],
+    });
+  }
+
+  /**
+   * 장중 자동 매도 알림. 결재 버튼은 없다.
+   */
+  async sendSellNotice(notice: SellNotice): Promise<void> {
+    const title =
+      notice.trigger === 'STOP_LOSS'
+        ? '손절 매도'
+        : notice.trigger === 'TAKE_PROFIT'
+          ? '익절 매도'
+          : '위험 공시 매도';
+    const name = notice.companyName || notice.symbol;
+    const price =
+      notice.price > 0 ? `${notice.price.toLocaleString()}원` : '-';
+
+    await this.app.client.chat.postMessage({
+      channel: this.defaultChannel,
+      text: `${title}: ${name}`,
+      blocks: [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: title, emoji: true },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text:
+              `• 종목: *${name}* (${notice.symbol})\n` +
+              `• 수량: ${notice.quantity}주 @ ${price}\n` +
+              `• 사유: ${notice.reason}`,
+          },
+        },
+      ],
+    });
+  }
+
+  /**
+   * 당일 매수/매도 리포트. 거래가 없으면 보내지 않고 false.
+   */
+  async sendDailyTradeReport(): Promise<boolean> {
+    const trades = await this.prisma.tradeHistory.findMany({
+      where: { orderedAt: { gte: this.startOfTodayKst() } },
+      orderBy: { orderedAt: 'asc' },
+    });
+
+    if (trades.length === 0) {
+      return false;
+    }
+
+    const day = new Intl.DateTimeFormat('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+
+    const buys = trades.filter((item) => item.orderType === 'BUY');
+    const sells = trades.filter((item) => item.orderType === 'SELL');
+    const formatLine = (item: (typeof trades)[number]) => {
+      const time = new Intl.DateTimeFormat('ko-KR', {
+        timeZone: 'Asia/Seoul',
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(item.filledAt ?? item.orderedAt);
+      const price = item.price > 0 ? `${item.price.toLocaleString()}원` : '-';
+      return `• ${item.symbol} ${item.quantity}주 @ ${price} (${item.status}, ${time})`;
+    };
+
+    const buyBlock =
+      buys.length > 0
+        ? `*매수 ${buys.length}건*\n${buys.map(formatLine).join('\n')}`
+        : '*매수*\n없음';
+    const sellBlock =
+      sells.length > 0
+        ? `*매도 ${sells.length}건*\n${sells.map(formatLine).join('\n')}`
+        : '*매도*\n없음';
+
+    await this.app.client.chat.postMessage({
+      channel: this.defaultChannel,
+      text: `${day} 매매 리포트`,
+      blocks: [
+        {
+          type: 'header',
+          text: {
+            type: 'plain_text',
+            text: `${day} 매매 리포트`,
+            emoji: true,
+          },
+        },
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: `${buyBlock}\n\n${sellBlock}` },
+        },
+      ],
+    });
+
+    this.logger.log(`당일 매매 리포트 전송: 매수 ${buys.length} / 매도 ${sells.length}`);
+    return true;
+  }
+
+  private startOfTodayKst(): Date {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+    return new Date(`${parts}T00:00:00+09:00`);
   }
 
   /**

@@ -119,6 +119,15 @@ export class WatchListController {
           dartId: undefined,
         });
 
+        if (!messageTs) {
+          results.push({
+            success: false,
+            symbol: stock.symbol,
+            error: '예수금으로 1주를 살 수 없어 슬랙 알림을 보내지 않음',
+          });
+          continue;
+        }
+
         results.push({
           success: true,
           symbol: stock.symbol,
@@ -197,6 +206,13 @@ export class WatchListController {
       llmScore: strategyLog.llmScore,
       dartId: undefined,
     });
+
+    if (!messageTs) {
+      return {
+        success: false,
+        message: `${body.symbol}은(는) 예수금으로 1주를 살 수 없어 슬랙 알림을 보내지 않았습니다.`,
+      };
+    }
 
     return {
       success: true,

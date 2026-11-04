@@ -15,17 +15,22 @@ import type {
   AccountBalanceResponse,
   AccountsApiResponse,
   ApiError,
+  ApprovedBuyExecution,
+  BuyAllocation,
   BuyingPower,
   BuyingPowerApiResponse,
   CreateOrderRequest,
   CreateOrderResponse,
   Currency,
   ErrorResponse,
+  GetOrderResponse,
   OAuth2ErrorResponse,
   Order,
+  OrderStatus,
   PriceCheckResult,
   PricesApiResponse,
   TossAccount,
+  TossOrderDetail,
 } from './interfaces/toss-api.interface.js';
 
 @Injectable()
@@ -39,6 +44,7 @@ export class TossApiService {
 
   private cachedToken: string | null = null;
   private tokenExpiresAt = 0;
+  private tokenRefreshPromise: Promise<string> | null = null;
 
   // Rate Limiters (TPS 제한)
   private readonly accountLimiter: Bottleneck;
@@ -106,15 +112,25 @@ export class TossApiService {
         const is429 = status === HttpStatus.TOO_MANY_REQUESTS;
         const isTimeout =
           axiosError.code === 'ECONNABORTED' || axiosError.code === 'ETIMEDOUT';
+        const isTokenRevoked = this.isTokenRevokedError(error);
 
-        // 429 또는 타임아웃이 아니면 즉시 에러 throw
-        if (!is429 && !isTimeout) {
-          // 일반 HTTP 에러 로깅
-          const statusCode = status?.toString() || 'UNKNOWN';
-          const message = axiosError.response?.data 
-            ? JSON.stringify(axiosError.response.data)
-            : axiosError.message;
-          await this.logError('TossAPI', statusCode, `${errorMessage}: ${message}`);
+        if (isTokenRevoked) {
+          this.clearTokenCache();
+          this.logger.warn(
+            `${errorMessage} - 토큰이 폐기되어 재발급 후 재시도합니다 (${attempt}/${maxRetries})`,
+          );
+        }
+
+        // 429, 타임아웃, 토큰 폐기가 아니면 즉시 에러 throw
+        if (!is429 && !isTimeout && !isTokenRevoked) {
+          // 매수가능금액 부족은 수량을 줄여 재시도하므로 여기서 ErrorLog를 남기지 않는다
+          if (!this.isInsufficientBuyingPowerError(error)) {
+            const statusCode = status?.toString() || 'UNKNOWN';
+            const message = axiosError.response?.data
+              ? JSON.stringify(axiosError.response.data)
+              : axiosError.message;
+            await this.logError('TossAPI', statusCode, `${errorMessage}: ${message}`);
+          }
           throw error;
         }
 
@@ -495,7 +511,7 @@ export class TossApiService {
    * @returns 생성된 주문 정보
    */
   async createOrder(request: CreateOrderRequest): Promise<Order> {
-    return this.orderLimiter.schedule(async () => {
+    const created = await this.orderLimiter.schedule(async () => {
       return this.executeWithRetry(async () => {
         const accessToken = await this.getAccessToken();
         const accountSeq = await this.resolveAccountSeq();
@@ -504,10 +520,25 @@ export class TossApiService {
           `주문 생성 요청: ${request.orderSide} ${request.quantity ?? request.orderAmount} ${request.symbol} @ ${request.orderPrice ?? 'MARKET'}`,
         );
 
+        // 토스 Open API 는 orderSide/orderPrice 가 아니라 side/price 를 쓴다
+        const tossBody: Record<string, string | boolean> = {
+          symbol: request.symbol,
+          side: request.orderSide,
+          orderType: request.orderType,
+        };
+        if (request.quantity) tossBody.quantity = request.quantity;
+        if (request.orderAmount) tossBody.orderAmount = request.orderAmount;
+        if (request.orderType === 'LIMIT' && request.orderPrice) {
+          tossBody.price = request.orderPrice;
+        }
+        if (request.timeInForce) tossBody.timeInForce = request.timeInForce;
+        if (request.clientOrderId) tossBody.clientOrderId = request.clientOrderId;
+        if (request.confirmHighValueOrder) tossBody.confirmHighValueOrder = true;
+
         const { data } = await firstValueFrom(
           this.httpService.post<CreateOrderResponse>(
             `${this.baseUrl}/api/v1/orders`,
-            request,
+            tossBody,
             {
               headers: this.buildAuthHeaders(accessToken, accountSeq),
               timeout: 15_000, // 주문은 타임아웃을 조금 더 길게
@@ -515,15 +546,38 @@ export class TossApiService {
           ),
         );
 
-        this.logger.log(
-          `주문 생성 성공: orderId=${data.result.orderId}, status=${data.result.status}`,
-        );
-
-        // 거래 내역을 데이터베이스에 저장
-        await this.logTrade(data.result, request);
-
+        this.logger.log(`주문 생성 성공: orderId=${data.result.orderId}`);
         return data.result;
       }, `주문 생성에 실패했습니다: ${request.orderSide} ${request.symbol}`);
+    });
+
+    // 체결 조회 실패가 주문을 다시 넣지 않도록 POST 재시도 루프 밖에서 조회한다
+    const detail = await this.waitForOrderFill(created.orderId, request);
+    await this.logTrade(detail, request);
+    return this.toOrder(detail, request);
+  }
+
+  /**
+   * 주문 상세 조회 (GET /api/v1/orders/{orderId})
+   */
+  async getOrder(orderId: string): Promise<TossOrderDetail> {
+    return this.orderLimiter.schedule(async () => {
+      return this.executeWithRetry(async () => {
+        const accessToken = await this.getAccessToken();
+        const accountSeq = await this.resolveAccountSeq();
+
+        const { data } = await firstValueFrom(
+          this.httpService.get<GetOrderResponse>(
+            `${this.baseUrl}/api/v1/orders/${encodeURIComponent(orderId)}`,
+            {
+              headers: this.buildAuthHeaders(accessToken, accountSeq),
+              timeout: 10_000,
+            },
+          ),
+        );
+
+        return data.result;
+      }, `주문 조회에 실패했습니다: ${orderId}`);
     });
   }
 
@@ -532,7 +586,7 @@ export class TossApiService {
    * @param symbol 종목 코드
    * @returns 주문 정보
    */
-  async buyMarket1Share(symbol: string): Promise<Order> {
+  async buyMarket1Share(symbol: string, strategyId?: number): Promise<Order> {
     // 예수금 확인
     const validation = await this.validateBuyingPower(symbol);
     
@@ -562,7 +616,258 @@ export class TossApiService {
       orderSide: 'BUY',
       orderType: 'MARKET',
       quantity: '1',
+      strategyId,
     });
+  }
+
+  /**
+   * 지정 수량 시장가 매수
+   */
+  async buyMarketShares(
+    symbol: string,
+    quantity: number,
+    strategyId?: number,
+  ): Promise<Order> {
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: '매수 수량은 1주 이상 정수여야 합니다.',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const validation = await this.validateBuyingPower(symbol);
+    const maxByCash = Math.floor(validation.availableCash / validation.currentPrice);
+    if (maxByCash < 1) {
+      const errorMessage =
+        `예수금이 부족하여 ${symbol} 1주를 매수할 수 없습니다. ` +
+        `(현재가: ${validation.currentPrice.toLocaleString()}원, 예수금: ${validation.availableCash.toLocaleString()}원)`;
+      await this.logError('TossAPI', '422', errorMessage);
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+          message: `예수금이 부족하여 ${symbol} 1주를 매수할 수 없습니다.`,
+          detail: {
+            symbol,
+            quantity,
+            currentPrice: validation.currentPrice,
+            availableCash: validation.availableCash,
+            shortfall: validation.currentPrice - validation.availableCash,
+          },
+        },
+        HttpStatus.UNPROCESSABLE_ENTITY,
+      );
+    }
+
+    let remainingQty = Math.min(quantity, maxByCash);
+    if (remainingQty < quantity) {
+      this.logger.warn(
+        `${symbol} 예수금 기준으로 수량을 ${quantity}주 → ${remainingQty}주로 줄입니다. ` +
+          `(예수금 ${validation.availableCash.toLocaleString()}원 / 현재가 ${validation.currentPrice.toLocaleString()}원)`,
+      );
+    }
+
+    while (remainingQty >= 1) {
+      try {
+        return await this.createOrder({
+          symbol,
+          orderSide: 'BUY',
+          orderType: 'MARKET',
+          quantity: String(remainingQty),
+          strategyId,
+        });
+      } catch (error) {
+        if (!this.isInsufficientBuyingPowerError(error) || remainingQty <= 1) {
+          if (this.isInsufficientBuyingPowerError(error)) {
+            const errorMessage =
+              `매수가능금액이 부족하여 ${symbol} 1주도 매수할 수 없습니다.`;
+            await this.logError('TossAPI', '422', errorMessage);
+          }
+          throw error;
+        }
+
+        remainingQty -= 1;
+        this.logger.warn(
+          `${symbol} 토스 매수가능금액 부족, 수량을 ${remainingQty + 1}주 → ${remainingQty}주로 줄여 재시도합니다.`,
+        );
+      }
+    }
+
+    throw new HttpException(
+      {
+        statusCode: HttpStatus.UNPROCESSABLE_ENTITY,
+        message: `예수금이 부족하여 ${symbol}을(를) 매수할 수 없습니다.`,
+      },
+      HttpStatus.UNPROCESSABLE_ENTITY,
+    );
+  }
+
+  /**
+   * 오늘 승인되고 아직 주문하지 않은 종목에 예수금을 균등 배분해 시장가 매수한다.
+   * 1주도 못 사는 종목은 빼고 나머지로 다시 나눈다.
+   */
+  async executeApprovedBuys(): Promise<ApprovedBuyExecution> {
+    const pending = await this.prisma.strategyLog.findMany({
+      where: {
+        isApproved: true,
+        decision: 'BUY',
+        analyzedAt: { gte: this.startOfTodayKst() },
+        trades: { none: {} },
+      },
+      orderBy: { analyzedAt: 'desc' },
+    });
+
+    const latestBySymbol = new Map<string, (typeof pending)[number]>();
+    for (const log of pending) {
+      if (!latestBySymbol.has(log.symbol)) {
+        latestBySymbol.set(log.symbol, log);
+      }
+    }
+    const unique = [...latestBySymbol.values()];
+    const skipped: ApprovedBuyExecution['skipped'] = [];
+
+    if (unique.length === 0) {
+      this.logger.log('오늘 승인 대기 매수가 없습니다.');
+      return { cashBuyingPower: 0, allocations: [], skipped, orders: [] };
+    }
+
+    const buyingPower = await this.getBuyingPower('KRW');
+    const cashBuyingPower = parseFloat(buyingPower.cashBuyingPower);
+
+    const priced: Array<{ symbol: string; strategyId: number; price: number }> = [];
+    for (const log of unique) {
+      try {
+        const priceInfo = await this.getCurrentPrice(log.symbol);
+        if (priceInfo.currentPrice <= 0) {
+          skipped.push({
+            symbol: log.symbol,
+            strategyId: log.id,
+            reason: '현재가를 확인할 수 없음',
+          });
+          continue;
+        }
+        priced.push({
+          symbol: log.symbol,
+          strategyId: log.id,
+          price: priceInfo.currentPrice,
+        });
+      } catch (error) {
+        skipped.push({
+          symbol: log.symbol,
+          strategyId: log.id,
+          reason: `현재가 조회 실패: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
+
+    const allocations = this.allocateEqualCash(priced, cashBuyingPower);
+    const allocatedSymbols = new Set(allocations.map((item) => item.symbol));
+    for (const item of priced) {
+      if (!allocatedSymbols.has(item.symbol)) {
+        skipped.push({
+          symbol: item.symbol,
+          strategyId: item.strategyId,
+          reason: `배분 금액(${Math.floor(cashBuyingPower / Math.max(priced.length, 1)).toLocaleString()}원)으로 1주를 살 수 없음 (현재가 ${item.price.toLocaleString()}원)`,
+        });
+      }
+    }
+
+    const orders: Order[] = [];
+    for (const allocation of allocations) {
+      this.logger.log(
+        `예수금 배분 매수: ${allocation.symbol} ${allocation.quantity}주 ` +
+          `(배분 ${allocation.budget.toLocaleString()}원 / 현재가 ${allocation.price.toLocaleString()}원)`,
+      );
+      try {
+        const order = await this.buyMarketShares(
+          allocation.symbol,
+          allocation.quantity,
+          allocation.strategyId,
+        );
+        orders.push(order);
+      } catch (error) {
+        const reason = `매수 실패: ${error instanceof Error ? error.message : String(error)}`;
+        this.logger.error(`${allocation.symbol} ${reason}`);
+        skipped.push({
+          symbol: allocation.symbol,
+          strategyId: allocation.strategyId,
+          reason,
+        });
+      }
+    }
+
+    return { cashBuyingPower, allocations, skipped, orders };
+  }
+
+  /**
+   * 매수가능금액을 종목 수만큼 균등 분할. 1주도 못 사는 종목은 제외하고 재분배.
+   * 주수 반올림으로 남은 돈은 배분액이 적은 종목부터 1주씩 더 붙인다.
+   * 토스가 시장가를 현재가보다 높게 잡으면 buyMarketShares가 수량을 줄인다.
+   */
+  allocateEqualCash(
+    entries: Array<{ symbol: string; strategyId: number; price: number }>,
+    cash: number,
+  ): BuyAllocation[] {
+    let pool = entries.filter((entry) => entry.price > 0 && entry.price <= cash);
+    if (pool.length === 0 || cash <= 0) {
+      return [];
+    }
+
+    while (pool.length > 0) {
+      const budget = Math.floor(cash / pool.length);
+      const affordable = pool.filter((entry) => entry.price <= budget);
+      if (affordable.length === pool.length) {
+        break;
+      }
+      pool = affordable;
+    }
+
+    if (pool.length === 0) {
+      return [];
+    }
+
+    const budget = Math.floor(cash / pool.length);
+    const allocations: BuyAllocation[] = pool.map((entry) => ({
+      ...entry,
+      budget,
+      quantity: Math.floor(budget / entry.price),
+    }));
+
+    let leftover = cash - allocations.reduce(
+      (sum, item) => sum + item.quantity * item.price,
+      0,
+    );
+
+    while (leftover > 0) {
+      const next = allocations
+        .filter((item) => item.price <= leftover)
+        .sort((a, b) => {
+          const spendDiff = a.quantity * a.price - b.quantity * b.price;
+          if (spendDiff !== 0) {
+            return spendDiff;
+          }
+          return a.price - b.price;
+        })[0];
+      if (!next) {
+        break;
+      }
+      next.quantity += 1;
+      leftover -= next.price;
+    }
+
+    return allocations.filter((item) => item.quantity >= 1);
+  }
+
+  private startOfTodayKst(): Date {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+    return new Date(`${parts}T00:00:00+09:00`);
   }
 
   /**
@@ -571,12 +876,57 @@ export class TossApiService {
    * @returns 주문 정보
    */
   async sellMarket1Share(symbol: string): Promise<Order> {
+    return this.sellMarketShares(symbol, 1);
+  }
+
+  /**
+   * 지정 수량 시장가 매도
+   */
+  async sellMarketShares(
+    symbol: string,
+    quantity: number,
+    strategyId?: number,
+  ): Promise<Order> {
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: '매도 수량은 1주 이상 정수여야 합니다.',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
     return this.createOrder({
       symbol,
       orderSide: 'SELL',
       orderType: 'MARKET',
-      quantity: '1',
+      quantity: String(quantity),
+      strategyId,
     });
+  }
+
+  /**
+   * 정규장 시장가 주문 가능 여부. 15:20 이후 동시호가는 시장가가 거절될 수 있다.
+   */
+  async canPlaceRegularMarketOrder(): Promise<{
+    ok: boolean;
+    reason?: string;
+    inOpeningBuffer?: boolean;
+  }> {
+    const market = await this.getKRMarketStatus();
+    if (!market.isRegularMarketOpen) {
+      return { ok: false, reason: market.message ?? '정규장이 아님' };
+    }
+    const start = market.regularMarket?.start;
+    const end = market.regularMarket?.end;
+    if (end && Date.now() >= new Date(end).getTime() - 10 * 60 * 1000) {
+      return { ok: false, reason: '동시호가(15:20 이후)라 시장가 주문을 넣지 않음' };
+    }
+    const inOpeningBuffer = Boolean(
+      start && Date.now() < new Date(start).getTime() + 5 * 60 * 1000,
+    );
+    return { ok: true, inOpeningBuffer };
   }
 
   /**
@@ -643,6 +993,93 @@ export class TossApiService {
     });
   }
 
+  private static readonly TERMINAL_ORDER_STATUSES: ReadonlySet<OrderStatus> = new Set([
+    'FILLED',
+    'CANCELED',
+    'REJECTED',
+    'REPLACED',
+    'CANCEL_REJECTED',
+    'REPLACE_REJECTED',
+  ]);
+
+  /**
+   * 주문 생성 직후 체결 상세를 잠시 폴링한다.
+   * 시장가 정규장 주문은 보통 바로 FILLED가 되지만, 응답이 늦을 수 있다.
+   */
+  private async waitForOrderFill(
+    orderId: string,
+    request: CreateOrderRequest,
+  ): Promise<TossOrderDetail> {
+    const fallback: TossOrderDetail = {
+      orderId,
+      symbol: request.symbol,
+      side: request.orderSide,
+      orderType: request.orderType,
+      status: 'PENDING',
+      quantity: request.quantity ?? '1',
+      price: request.orderPrice,
+      currency: 'KRW',
+      orderedAt: new Date().toISOString(),
+    };
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      try {
+        const detail = await this.getOrder(orderId);
+        const filledPrice = detail.execution?.averageFilledPrice;
+        if (
+          TossApiService.TERMINAL_ORDER_STATUSES.has(detail.status) ||
+          (filledPrice && filledPrice !== '0')
+        ) {
+          this.logger.log(
+            `주문 체결 조회: orderId=${orderId} status=${detail.status} ` +
+              `fill=${detail.execution?.averageFilledPrice ?? '-'} qty=${detail.execution?.filledQuantity ?? '-'}`,
+          );
+          return detail;
+        }
+        fallback.status = detail.status;
+        Object.assign(fallback, detail);
+      } catch (error) {
+        lastError = error;
+        this.logger.warn(
+          `주문 체결 조회 재시도 ${attempt}/8: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      await this.sleep(400);
+    }
+
+    if (lastError) {
+      this.logger.warn(
+        `주문 체결 조회가 끝나지 않아 접수 정보만 저장합니다: orderId=${orderId}`,
+      );
+    }
+    return fallback;
+  }
+
+  private toOrder(detail: TossOrderDetail, request: CreateOrderRequest): Order {
+    return {
+      orderId: detail.orderId,
+      clientOrderId: detail.clientOrderId ?? undefined,
+      symbol: detail.symbol ?? request.symbol,
+      orderSide: detail.side ?? request.orderSide,
+      orderType: detail.orderType ?? request.orderType,
+      quantity: detail.quantity ?? request.quantity ?? '1',
+      orderPrice: detail.price,
+      filledQuantity: detail.execution?.filledQuantity ?? '0',
+      averageFillPrice: detail.execution?.averageFilledPrice,
+      status: detail.status ?? 'PENDING',
+      orderedAt: detail.orderedAt ?? new Date().toISOString(),
+      currency: detail.currency ?? 'KRW',
+    };
+  }
+
+  private parseWon(value?: string | null): number {
+    if (!value) return 0;
+    const parsed = parseInt(value.replace(/,/g, ''), 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
   /**
    * 계좌 목록에서 사용할 accountSeq 를 고릅니다.
    * ACCOUNT_NUMBER 가 있으면 해당 계좌를, 없으면 첫 번째 BROKERAGE 계좌를 사용합니다.
@@ -691,6 +1128,16 @@ export class TossApiService {
       return this.cachedToken;
     }
 
+    if (!this.tokenRefreshPromise) {
+      this.tokenRefreshPromise = this.issueAccessToken().finally(() => {
+        this.tokenRefreshPromise = null;
+      });
+    }
+
+    return this.tokenRefreshPromise;
+  }
+
+  private async issueAccessToken(): Promise<string> {
     try {
       const body = new URLSearchParams({
         grant_type: 'client_credentials',
@@ -713,11 +1160,27 @@ export class TossApiService {
 
       this.cachedToken = data.access_token;
       // 만료 60초 전에 재발급하도록 버퍼를 둡니다.
-      this.tokenExpiresAt = now + (data.expires_in - 60) * 1000;
+      this.tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000;
       return this.cachedToken;
     } catch (error) {
       throw this.handleApiError(error, '액세스 토큰 발급에 실패했습니다.', true);
     }
+  }
+
+  private isTokenRevokedError(error: unknown): boolean {
+    if (!(error instanceof AxiosError) || error.response?.status !== HttpStatus.UNAUTHORIZED) {
+      return false;
+    }
+    const data = error.response.data as { error?: { code?: string } } | undefined;
+    return data?.error?.code === 'token-revoked';
+  }
+
+  private isInsufficientBuyingPowerError(error: unknown): boolean {
+    if (!(error instanceof AxiosError) || error.response?.status !== HttpStatus.UNPROCESSABLE_ENTITY) {
+      return false;
+    }
+    const data = error.response.data as { error?: { code?: string } } | undefined;
+    return data?.error?.code === 'insufficient-buying-power';
   }
 
   private buildAuthHeaders(accessToken: string, accountSeq: number): Record<string, string> {
@@ -899,6 +1362,7 @@ export class TossApiService {
   private clearTokenCache(): void {
     this.cachedToken = null;
     this.tokenExpiresAt = 0;
+    this.tokenRefreshPromise = null;
   }
 
   /** OAuth2: error 가 문자열인 경우 */
@@ -969,21 +1433,35 @@ export class TossApiService {
 
   /**
    * 거래 내역을 TradeHistory 테이블에 기록
-   * @param order 주문 정보
+   * @param detail 토스 주문 상세 (체결 정보 포함)
    * @param request 주문 요청 정보
    */
-  private async logTrade(order: Order, request: CreateOrderRequest): Promise<void> {
+  private async logTrade(detail: TossOrderDetail, request: CreateOrderRequest): Promise<void> {
     try {
-      await this.prisma.tradeHistory.create({
-        data: {
-          symbol: request.symbol,
-          orderType: request.orderSide, // BUY or SELL
-          price: order.orderPrice ? parseInt(order.orderPrice, 10) : 0,
-          quantity: order.quantity ? parseInt(order.quantity, 10) : 1,
-          status: order.status, // COMPLETED, PENDING, REJECTED 등
-        },
-      });
-      this.logger.log(`✅ TradeHistory 저장 완료: ${request.orderSide} ${request.symbol}`);
+      const fillPrice = this.parseWon(detail.execution?.averageFilledPrice);
+      const fillQty =
+        this.parseWon(detail.execution?.filledQuantity) ||
+        this.parseWon(detail.quantity) ||
+        this.parseWon(request.quantity) ||
+        1;
+
+      const data = {
+        symbol: request.symbol,
+        orderType: request.orderSide,
+        price: fillPrice,
+        quantity: fillQty,
+        status: detail.status ?? 'PENDING',
+        orderId: detail.orderId,
+        filledAt: detail.execution?.filledAt
+          ? new Date(detail.execution.filledAt)
+          : null,
+        strategyId: request.strategyId,
+      };
+      await this.prisma.tradeHistory.create({ data });
+      this.logger.log(
+        `✅ TradeHistory 저장 완료: ${request.orderSide} ${request.symbol} ` +
+          `${fillQty}주 @ ${fillPrice} status=${detail.status} orderId=${detail.orderId}`,
+      );
     } catch (error) {
       // 로깅 실패는 주문 자체에 영향을 주지 않도록 에러를 삼킴
       this.logger.error(`❌ TradeHistory 저장 실패: ${error instanceof Error ? error.message : String(error)}`);

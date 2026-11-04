@@ -1,7 +1,8 @@
 // schema.prisma
 
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
@@ -24,16 +25,18 @@ model StrategyLog {
 
 // 2. 거래 내역 (TradeHistory) - 실제 토스 API로 쏜 주문 기록
 model TradeHistory {
-  id          Int      @id @default(autoincrement())
-  symbol      String   // 종목 코드
-  orderType   String   // BUY, SELL
-  price       Int      // 체결/주문 가격
-  quantity    Int      // 주문 수량
-  status      String   // 주문 상태 (COMPLETED, PENDING, REJECTED)
-  orderedAt   DateTime @default(now()) // 주문 발생 시간
-  
+  id          Int       @id @default(autoincrement())
+  symbol      String    // 종목 코드
+  orderType   String    // BUY, SELL
+  price       Int       // 체결 평균가. 미체결이면 0
+  quantity    Int       // 체결 수량. 미체결이면 주문 수량
+  status      String    // 토스 주문 상태 (FILLED, PENDING, REJECTED 등)
+  orderId     String?   @unique // 토스 주문 ID
+  filledAt    DateTime? // 체결 시각
+  orderedAt   DateTime  @default(now()) // 주문 발생 시간
+
   // 어떤 전략 로그(LLM 판단)를 보고 매수했는지 관계 설정
-  strategyId  Int?     
+  strategyId  Int?
   strategy    StrategyLog? @relation(fields: [strategyId], references: [id])
 }
 

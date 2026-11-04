@@ -1,0 +1,5 @@
+{
+  "days": 30,
+  "minScore": 7,
+  "sendToSlack": true
+}
