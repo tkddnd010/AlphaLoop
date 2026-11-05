@@ -24,6 +24,7 @@ export class DailySchedulerService {
     try {
       this.logger.log('자정 이후 관심종목 분석 시작');
       const result = await this.watchlistAnalysis.analyzeWatchList({
+        days: 7, // 최근 7일 공시만 분석
         sendToSlack: true,
       });
       this.logger.log(
