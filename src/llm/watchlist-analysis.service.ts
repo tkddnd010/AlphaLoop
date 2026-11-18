@@ -5,6 +5,7 @@ import { TossApiService } from '../toss-api/toss-api.service.js';
 import { WatchListService } from '../watchlist/watchlist.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { SlackService } from '../slack/slack.service.js';
+import { NaverFinanceService } from '../naver-finance/naver-finance.service.js';
 import type { AnalysisInput, StockAnalysisResult } from './interfaces/llm.interface.js';
 
 export interface WatchlistAnalysisRun {
@@ -33,6 +34,7 @@ export class WatchlistAnalysisService {
     private readonly watchlistService: WatchListService,
     private readonly prisma: PrismaService,
     private readonly slackService: SlackService,
+    private readonly naverFinanceService: NaverFinanceService,
   ) {}
 
   async analyzeWatchList(options?: {
@@ -72,11 +74,55 @@ export class WatchlistAnalysisService {
       }
     }
 
+    // 공시 기반 LLM 분석
     const batchResult = await this.llmService.analyzeBatch(analysisInputs);
 
+    // 기술적 지표 계산 및 복합 점수 적용
+    const enhancedResults: StockAnalysisResult[] = [];
+    for (const result of batchResult.results) {
+      try {
+        const technicalScore = await this.naverFinanceService.calculateTechnicalScore(
+          result.stockCode,
+          result.currentPrice,
+        );
+
+        // 최종 점수 = 공시 30% + 기술적 70%
+        const disclosureScore = result.score; // 공시 점수 (0~10)
+        const finalScore = Math.round(
+          disclosureScore * 0.3 + technicalScore.score * 0.7,
+        );
+
+        // 이유에 기술적 신호 추가
+        const techSignals = technicalScore.signals.length > 0
+          ? `\n📊 기술적 신호: ${technicalScore.signals.join(', ')}`
+          : '';
+        const techWarnings = technicalScore.warnings.length > 0
+          ? `\n⚠️ 주의: ${technicalScore.warnings.join(', ')}`
+          : '';
+
+        enhancedResults.push({
+          ...result,
+          score: finalScore,
+          reason: result.reason + techSignals + techWarnings,
+        });
+
+        this.logger.log(
+          `${result.stockCode} 점수: 공시 ${disclosureScore}점 → ` +
+          `기술적 ${technicalScore.score}점 → 최종 ${finalScore}점`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `${result.stockCode} 기술적 지표 계산 실패, 공시 점수만 사용: ${error}`,
+        );
+        enhancedResults.push(result); // 공시 점수만 사용
+      }
+    }
+
+    // 고득점 종목 필터링
+    const highScoreStocks = enhancedResults.filter((r) => r.score >= minScore);
+
     const savedLogs: Array<StockAnalysisResult & { strategyLogId: number }> = [];
-    for (const result of batchResult.highScoreStocks) {
-      if (result.score < minScore) continue;
+    for (const result of highScoreStocks) {
       const strategyLog = await this.prisma.strategyLog.create({
         data: {
           symbol: result.stockCode,
@@ -92,7 +138,7 @@ export class WatchlistAnalysisService {
 
     const slackResults: WatchlistAnalysisRun['slackResults'] = [];
     if (sendToSlack) {
-      await this.slackService.sendWatchlistBriefing(batchResult.results);
+      await this.slackService.sendWatchlistBriefing(enhancedResults);
 
       for (const log of savedLogs) {
         try {
@@ -133,10 +179,10 @@ export class WatchlistAnalysisService {
     return {
       success: true,
       analyzed: batchResult.totalAnalyzed,
-      highScoreCount: batchResult.highScoreStocks.length,
+      highScoreCount: highScoreStocks.length,
       savedToDb: savedLogs.length,
       sentToSlack: slackResults.filter((item) => item.sent).length,
-      results: batchResult.results,
+      results: enhancedResults,
       slackResults,
     };
   }

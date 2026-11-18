@@ -10,6 +10,7 @@ import { WatchListModule } from './watchlist/watchlist.module.js';
 import { DartModule } from './dart/dart.module.js';
 import { LLMModule } from './llm/llm.module.js';
 import { JobsModule } from './jobs/jobs.module.js';
+import { NaverFinanceModule } from './naver-finance/naver-finance.module.js';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { JobsModule } from './jobs/jobs.module.js';
     DartModule,
     LLMModule,
     JobsModule,
+    NaverFinanceModule,
   ],
   controllers: [AppController],
   providers: [AppService],
