@@ -111,10 +111,14 @@ export class WatchlistAnalysisService {
           `기술적 ${technicalScore.score}점 → 최종 ${finalScore}점`,
         );
       } catch (error) {
-        this.logger.warn(
+        this.logger.error(
           `${result.stockCode} 기술적 지표 계산 실패, 공시 점수만 사용: ${error}`,
         );
-        enhancedResults.push(result); // 공시 점수만 사용
+        // 기술적 지표 실패 시 공시 점수만 사용 (복합 점수 없음)
+        enhancedResults.push({
+          ...result,
+          reason: result.reason + '\n⚠️ 기술적 지표 계산 실패 (공시 점수만 사용)',
+        });
       }
     }
 
