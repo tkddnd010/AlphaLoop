@@ -127,13 +127,23 @@ export class WatchlistAnalysisService {
 
     const savedLogs: Array<StockAnalysisResult & { strategyLogId: number }> = [];
     for (const result of highScoreStocks) {
+      // 복합 점수에 따라 매매 결정 재계산
+      let decision: string;
+      if (result.score >= 7) {
+        decision = 'BUY';
+      } else if (result.score >= 4) {
+        decision = 'HOLD';
+      } else {
+        decision = 'SELL';
+      }
+
       const strategyLog = await this.prisma.strategyLog.create({
         data: {
           symbol: result.stockCode,
           dartId: null,
           llmScore: result.score,
           reason: result.reason,
-          decision: result.recommendation,
+          decision: decision,
           isApproved: false,
         },
       });
