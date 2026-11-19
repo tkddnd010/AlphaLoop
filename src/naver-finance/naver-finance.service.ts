@@ -157,25 +157,47 @@ export class NaverFinanceService {
     const signals: string[] = [];
     const warnings: string[] = [];
 
-    // 1. 골든크로스 (+2점)
+    // 추세 판단 (20일 가격 변화)
+    const isUptrend = indicators.priceChange20d !== null && indicators.priceChange20d > 0;
+    const isDowntrend = indicators.priceChange20d !== null && indicators.priceChange20d < -5;
+
+    // 1. 골든크로스 (추세 확인)
     if (indicators.goldenCross) {
-      score += 2;
-      signals.push('골든크로스 (5일선 > 20일선)');
+      if (isUptrend) {
+        score += 2;
+        signals.push('골든크로스 + 상승추세');
+      } else {
+        score += 1;
+        signals.push('골든크로스 (추세 약함)');
+      }
     } else if (
       indicators.ma5 !== null &&
       indicators.ma20 !== null &&
       indicators.ma5 < indicators.ma20
     ) {
-      score -= 1;
-      warnings.push('데드크로스 (5일선 < 20일선)');
+      if (isDowntrend) {
+        score -= 2;
+        warnings.push('데드크로스 + 하락추세');
+      } else {
+        score -= 1;
+        warnings.push('데드크로스');
+      }
     }
 
-    // 2. 거래량 급증 (+2점)
+    // 2. 거래량 급증 (가격 동시 확인)
     if (indicators.volumeSurge) {
-      score += 2;
-      signals.push(
-        `거래량 급증 (평균 대비 ${indicators.volumeRatio?.toFixed(0)}%)`,
-      );
+      if (indicators.priceChange5d !== null && indicators.priceChange5d > 0) {
+        score += 2;
+        signals.push(
+          `거래량 급증 + 상승 (평균 대비 ${indicators.volumeRatio?.toFixed(1)}배)`,
+        );
+      } else if (indicators.priceChange5d !== null && indicators.priceChange5d < -3) {
+        score -= 1;
+        warnings.push('거래량 급증 + 하락 (악재 가능성)');
+      } else {
+        score += 1;
+        signals.push('거래량 급증 (횡보)');
+      }
     } else if (
       indicators.volumeRatio !== null &&
       indicators.volumeRatio < 0.5
@@ -184,16 +206,20 @@ export class NaverFinanceService {
       warnings.push('거래량 위축');
     }
 
-    // 3. RSI 과매도 (+1점)
+    // 3. RSI (추세 동시 확인 - 칼날 잡기 방지)
     if (indicators.rsiOversold) {
-      score += 1;
-      signals.push(`RSI 과매도 (${indicators.rsi?.toFixed(0)})`);
+      if (!isDowntrend) {
+        score += 1;
+        signals.push(`RSI 과매도 + 반등 가능 (${indicators.rsi?.toFixed(0)})`);
+      } else {
+        warnings.push(`RSI 과매도 but 하락추세 (${indicators.rsi?.toFixed(0)}) - 칼날 주의`);
+      }
     } else if (indicators.rsi !== null && indicators.rsi > 70) {
       score -= 1;
       warnings.push(`RSI 과매수 (${indicators.rsi.toFixed(0)})`);
     }
 
-    // 4. 단기 상승 추세 (+1점)
+    // 4. 단기 상승 추세
     if (indicators.priceChange5d !== null && indicators.priceChange5d > 5) {
       score += 1;
       signals.push(`5일 상승 (+${indicators.priceChange5d.toFixed(1)}%)`);

@@ -86,10 +86,10 @@ export class WatchlistAnalysisService {
           result.currentPrice,
         );
 
-        // 최종 점수 = 공시 30% + 기술적 70%
+        // 최종 점수 = 공시 60% + 기술적 40%
         const disclosureScore = result.score; // 공시 점수 (0~10)
         const finalScore = Math.round(
-          disclosureScore * 0.3 + technicalScore.score * 0.7,
+          disclosureScore * 0.6 + technicalScore.score * 0.4,
         );
 
         // 이유에 기술적 신호 추가
