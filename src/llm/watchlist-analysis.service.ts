@@ -82,9 +82,24 @@ export class WatchlistAnalysisService {
           this.logger.warn(`${symbol} 현재가 조회 실패, 공시만으로 분석 진행`);
         }
 
+        // 회사명 가져오기 (공시 없으면 최근 공시 1건만 조회)
+        let companyName = disclosures[0]?.corp_name;
+        if (!companyName || companyName === symbol) {
+          try {
+            const oldDisclosures = await this.dartService.getRecentDisclosures(
+              symbol,
+              365,  // 1년 범위
+              1,    // 단 1건만 (회사명만 필요)
+            );
+            companyName = oldDisclosures[0]?.corp_name || symbol;
+          } catch {
+            companyName = symbol;
+          }
+        }
+
         analysisInputs.push({
           stockCode: symbol,
-          companyName: disclosures[0]?.corp_name || symbol,
+          companyName: companyName,
           currentPrice,
           disclosures: disclosureSummary,
         });

@@ -114,6 +114,7 @@ export class DartService {
   async getRecentDisclosures(
     stockCode: string,
     days = 30,
+    limit?: number, // 최대 조회 건수 (회사명만 필요할 때 1 사용)
   ): Promise<DartDisclosure[]> {
     const endDate = new Date();
     const startDate = new Date();
@@ -123,7 +124,7 @@ export class DartService {
       stock_code: stockCode.padStart(6, '0'), // 6자리로 패딩
       bgn_de: this.formatDate(startDate),
       end_de: this.formatDate(endDate),
-      page_count: 100, // 최대 100건
+      page_count: limit || 100, // limit 지정 시 그 값 사용
     };
 
     try {
