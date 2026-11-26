@@ -37,11 +37,14 @@ export class IntradayExitService {
   private running = false;
   private static readonly STOP_LOSS_CONFIRM_TICKS = 2;
 
+  // 위험 공시 키워드
   private static readonly DANGEROUS_TITLE_PATTERNS = [
     '영업정지',
+    '거래정지',
     '상장폐지',
     '감사의견거절',
     '감사의견 거절',
+    '감사의견 부적정',
     '횡령',
     '배임',
     '회생절차',
@@ -50,6 +53,24 @@ export class IntradayExitService {
     '자본잠식',
     '회계처리기준위반',
     '회계부정',
+    '유상증자',
+    '주주배정',
+    '감자', // 무상감자, 자본금감소
+    '소송제기',
+    '소송패소',
+  ];
+
+  // 위험 키워드 예외 (호재 또는 중립)
+  private static readonly SAFE_EXCEPTION_PATTERNS = [
+    '취소',
+    '취하',
+    '승소',
+    '기각',
+    '무혐의',
+    '무죄',
+    '종결',
+    '해제',
+    '철회',
   ];
 
   constructor(
@@ -375,10 +396,24 @@ export class IntradayExitService {
 
   private matchDangerousTitle(reportName: string): boolean {
     const compact = reportName.replace(/\s+/g, '');
-    return IntradayExitService.DANGEROUS_TITLE_PATTERNS.some(
+    
+    // 1. 위험 키워드 체크
+    const hasDanger = IntradayExitService.DANGEROUS_TITLE_PATTERNS.some(
       (pattern) =>
         reportName.includes(pattern) || compact.includes(pattern.replace(/\s+/g, '')),
     );
+    
+    if (!hasDanger) {
+      return false;
+    }
+    
+    // 2. 예외 키워드 체크 (호재/중립)
+    const hasSafeException = IntradayExitService.SAFE_EXCEPTION_PATTERNS.some(
+      (pattern) =>
+        reportName.includes(pattern) || compact.includes(pattern.replace(/\s+/g, '')),
+    );
+    
+    return !hasSafeException;
   }
 
   private async sellHolding(

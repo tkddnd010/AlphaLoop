@@ -51,7 +51,28 @@ export class WatchlistAnalysisService {
 
     for (const symbol of symbols) {
       try {
-        const disclosures = await this.dartService.getRecentDisclosures(symbol, days);
+        const allDisclosures = await this.dartService.getRecentDisclosures(symbol, days);
+        
+        // 최근 7일 이내 이미 분석한 공시 제외 (중복 방지)
+        const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+        const newDisclosures = [];
+        
+        for (const disclosure of allDisclosures) {
+          const analyzed = await this.prisma.strategyLog.findFirst({
+            where: {
+              symbol: symbol,
+              dartId: disclosure.rcept_no,
+              createdAt: { gte: new Date(sevenDaysAgo) },
+            },
+          });
+          
+          if (!analyzed) {
+            newDisclosures.push(disclosure);
+          }
+        }
+        
+        // 신규 공시가 없으면 기술적 지표만으로 평가 (공시 점수 5점 기본)
+        const disclosures = newDisclosures.length > 0 ? newDisclosures : allDisclosures.slice(0, 3);
         const disclosureSummary =
           await this.dartService.generateDisclosureSummaryAsync(disclosures);
 
@@ -69,6 +90,12 @@ export class WatchlistAnalysisService {
           currentPrice,
           disclosures: disclosureSummary,
         });
+        
+        if (newDisclosures.length < allDisclosures.length) {
+          this.logger.log(
+            `${symbol} 최근 7일 이내 분석 완료 공시 ${allDisclosures.length - newDisclosures.length}건 제외`,
+          );
+        }
       } catch (error) {
         this.logger.error(`${symbol} 데이터 수집 실패: ${error}`);
       }
