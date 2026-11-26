@@ -49,29 +49,27 @@ export class WatchlistAnalysisService {
     const symbols = this.watchlistService.getSymbols();
     const analysisInputs: AnalysisInput[] = [];
 
+    // 최근 7일 이내 분석한 공시 ID 목록 (한 번에 조회 - 성능 개선)
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const analyzedRecords = await this.prisma.strategyLog.findMany({
+      where: {
+        dartId: { not: null },
+        analyzedAt: { gte: new Date(sevenDaysAgo) },
+      },
+      select: { dartId: true },
+    });
+    const analyzedDartIds = new Set(analyzedRecords.map((r) => r.dartId).filter(Boolean));
+    
     for (const symbol of symbols) {
       try {
         const allDisclosures = await this.dartService.getRecentDisclosures(symbol, days);
         
-        // 최근 7일 이내 이미 분석한 공시 제외 (중복 방지)
-        const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-        const newDisclosures = [];
+        // 이미 분석한 공시 제외
+        const newDisclosures = allDisclosures.filter(
+          (d) => !analyzedDartIds.has(d.rcept_no),
+        );
         
-        for (const disclosure of allDisclosures) {
-          const analyzed = await this.prisma.strategyLog.findFirst({
-            where: {
-              symbol: symbol,
-              dartId: disclosure.rcept_no,
-              createdAt: { gte: new Date(sevenDaysAgo) },
-            },
-          });
-          
-          if (!analyzed) {
-            newDisclosures.push(disclosure);
-          }
-        }
-        
-        // 신규 공시가 없으면 기술적 지표만으로 평가 (공시 점수 5점 기본)
+        // 신규 공시가 없으면 최근 3개만 사용 (기술적 지표 중심)
         const disclosures = newDisclosures.length > 0 ? newDisclosures : allDisclosures.slice(0, 3);
         const disclosureSummary =
           await this.dartService.generateDisclosureSummaryAsync(disclosures);
