@@ -82,14 +82,14 @@ export class WatchlistAnalysisService {
           this.logger.warn(`${symbol} 현재가 조회 실패, 공시만으로 분석 진행`);
         }
 
-        // 회사명 가져오기 (공시 없으면 최근 공시 1건만 조회)
+        // 회사명 가져오기 (공시 없으면 최근 90일 공시 1건만 조회)
         let companyName = disclosures[0]?.corp_name;
         if (!companyName || companyName === symbol) {
           try {
             const oldDisclosures = await this.dartService.getRecentDisclosures(
               symbol,
-              365,  // 1년 범위
-              1,    // 단 1건만 (회사명만 필요)
+              90,  // 90일 (DART API stock_code 제약)
+              1,   // 단 1건만 (회사명만 필요)
             );
             companyName = oldDisclosures[0]?.corp_name || symbol;
           } catch {
